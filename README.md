@@ -1,5 +1,5 @@
 # PDFCraft
-test
+
 <div align="center">
   <img src="public/images/logo.png" alt="PDFCraft Logo" width="120" height="120" />
   <h1>Professional PDF Tools</h1>
