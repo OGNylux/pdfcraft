@@ -37,6 +37,9 @@
     "tesseract.js": "^6.0.1",
     "zustand": "^5.0.0"
   },
+  "overrides": {
+    "@swc/helpers": "0.5.20"
+  },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",
     "@testing-library/dom": "^10.4.0",
