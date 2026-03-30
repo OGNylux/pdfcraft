@@ -12,6 +12,10 @@ const nextConfig = {
   // Enable static export for deployment flexibility
   output: 'export',
 
+  // Required for GitHub Pages deployment under a subpath
+  basePath: '/pdfcraft',
+  assetPrefix: '/pdfcraft',
+
   // Webpack configuration for WASM modules
   webpack: (config, { isServer, webpack }) => {
     // Handle qpdf-wasm and other modules that use Node.js built-ins
