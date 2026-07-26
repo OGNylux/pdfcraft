@@ -68,6 +68,12 @@ jobs:
         env:
           # Add any required environment variables here
           NODE_ENV: production
+          # Fork: Pages serves this as a project site at /pdfcraft, so the export
+          # needs a matching basePath or every /_next/* asset 404s (blank page).
+          # Must be the NEXT_PUBLIC_ variant — next.config.js falls back to it for
+          # basePath, and it is the one inlined into the client bundle, which is
+          # where src/lib/utils/path.ts reads it at runtime.
+          NEXT_PUBLIC_BASE_PATH: /pdfcraft
 
       # Upload artifact for deployment
       - name: Upload artifact
