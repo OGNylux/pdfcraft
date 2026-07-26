@@ -1,0 +1,307 @@
+# =============================================================================
+# PDFCraft Release Workflow
+# Builds the production image from ./Dockerfile, publishes it to the GitHub
+# Container Registry, and cuts a GitHub Release whose assets are extracted
+# from that same image (so the release and the image are byte-identical).
+#
+# Trigger:
+#   - push a semver tag:  git tag v1.2.3 && git push origin v1.2.3
+#   - or run manually from the Actions tab with a version like v1.2.3
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. v1.2.3)'
+        required: true
+        type: string
+      draft:
+        description: 'Create the GitHub Release as a draft'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time; never cancel a release mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ============================================================================
+  # Stage 1: Work out the version and the (lowercase) image name once
+  # ============================================================================
+  prepare:
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.v.outputs.version }}             # v1.2.3
+      number: ${{ steps.v.outputs.number }}               # 1.2.3
+      major_minor: ${{ steps.v.outputs.major_minor }}     # 1.2
+      major: ${{ steps.v.outputs.major }}                 # 1
+      prerelease: ${{ steps.v.outputs.prerelease }}       # true for v1.2.3-rc1
+      image: ${{ steps.v.outputs.image }}                 # ghcr.io/owner/repo
+
+    steps:
+      - name: Resolve version and image name
+        id: v
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+
+          if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a valid semver tag (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+
+          NUMBER="${VERSION#v}"
+          CORE="${NUMBER%%-*}"
+          MAJOR="${CORE%%.*}"
+          MINOR="$(echo "$CORE" | cut -d. -f2)"
+
+          # Anything with a pre-release suffix (-rc1, -beta.2, ...) is not "latest".
+          if [ "$NUMBER" = "$CORE" ]; then PRERELEASE=false; else PRERELEASE=true; fi
+
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+
+          {
+            echo "version=$VERSION"
+            echo "number=$NUMBER"
+            echo "major_minor=$MAJOR.$MINOR"
+            echo "major=$MAJOR"
+            echo "prerelease=$PRERELEASE"
+            echo "image=$IMAGE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Releasing $VERSION as $IMAGE (prerelease=$PRERELEASE)"
+
+  # ============================================================================
+  # Stage 2: Build ./Dockerfile for each platform on a native runner, in
+  # parallel, and push each result by digest (no tags yet).
+  # ============================================================================
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Prepare environment
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          # image.source overrides the hardcoded label in the Dockerfile — it is
+          # what links the published GHCR package back to this repository.
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          # Share the cache scopes with the CI workflow so releases reuse warm layers.
+          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=build-${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ============================================================================
+  # Stage 3: Join the per-platform digests into one multi-arch manifest and
+  # give it the release tags.
+  # ============================================================================
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: release-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          TAGS="-t $IMAGE:${{ needs.prepare.outputs.number }}"
+          TAGS="$TAGS -t $IMAGE:${{ needs.prepare.outputs.major_minor }}"
+          TAGS="$TAGS -t $IMAGE:${{ needs.prepare.outputs.major }}"
+          if [ "${{ needs.prepare.outputs.prerelease }}" = "false" ]; then
+            TAGS="$TAGS -t $IMAGE:latest"
+          fi
+
+          docker buildx imagetools create $TAGS \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect published image
+        run: |
+          docker buildx imagetools inspect \
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.number }}
+
+  # ============================================================================
+  # Stage 4: Pull the published image back, lift the built site out of it, and
+  # attach it to a GitHub Release alongside a loadable image tarball.
+  # ============================================================================
+  release:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # create the release and its tag
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so release notes can diff against the previous tag
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract release assets from the image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          REF="$IMAGE:${{ needs.prepare.outputs.number }}"
+          docker pull --platform linux/amd64 "$REF"
+
+          # The static export lives where nginx serves it from (see nginx.conf).
+          CID=$(docker create "$REF")
+          docker cp "$CID:/website/pdfcraft" ./site
+          docker rm "$CID" > /dev/null
+
+          if [ ! -f ./site/index.html ]; then
+            echo "::error::No index.html in the extracted site — the image build produced nothing to release"
+            exit 1
+          fi
+
+          (cd site && zip -qr "../pdfcraft-$VERSION-static.zip" .)
+
+          # Offline install path: docker load < this file
+          docker save "$REF" | gzip > "pdfcraft-$VERSION-docker-amd64.tar.gz"
+
+          echo "Static bundle: $(du -h pdfcraft-$VERSION-static.zip | cut -f1)"
+          echo "Image tarball: $(du -h pdfcraft-$VERSION-docker-amd64.tar.gz | cut -f1)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: PDFCraft ${{ needs.prepare.outputs.version }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body: |
+            ## 🚀 PDFCraft ${{ needs.prepare.outputs.version }}
+
+            ### 🐳 Run with Docker
+
+            ```bash
+            docker run -d -p 8080:80 --name pdfcraft \
+              ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.number }}
+            ```
+
+            Then open <http://localhost:8080>. The image is multi-arch
+            (`linux/amd64` + `linux/arm64`) and serves the static build with nginx.
+
+            **Tags published:**
+            `${{ needs.prepare.outputs.number }}`,
+            `${{ needs.prepare.outputs.major_minor }}`,
+            `${{ needs.prepare.outputs.major }}`${{ needs.prepare.outputs.prerelease == 'false' && ', `latest`' || '' }}
+
+            ### 📦 Assets
+
+            - `pdfcraft-${{ needs.prepare.outputs.version }}-static.zip` — the built site, drop it behind any web server
+            - `pdfcraft-${{ needs.prepare.outputs.version }}-docker-amd64.tar.gz` — `docker load` this for air-gapped installs
+
+            ---
+            **Commit:** `${{ github.sha }}`
+          files: |
+            pdfcraft-${{ needs.prepare.outputs.version }}-static.zip
+            pdfcraft-${{ needs.prepare.outputs.version }}-docker-amd64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
